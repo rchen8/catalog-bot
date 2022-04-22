@@ -15,6 +15,9 @@ def get_eth_price():
     url = 'https://min-api.cryptocompare.com/data/pricemulti?fsyms=ETH&tsyms=USD'
     return requests.get(url).json()['ETH']['USD']
 
+def is_catalog_contract(contract_address):
+  return contract_address == '0x0bC2A24ce568DAd89691116d5B34DEB6C203F342'
+
 def get_catalog_records():
   url = 'https://catalog-prod.hasura.app/v1/graphql'
   headers = {
@@ -36,6 +39,7 @@ def get_catalog_records():
           id
           name
         }
+        contract_address
         nft_id
         short_url
         title
@@ -43,7 +47,37 @@ def get_catalog_records():
     }"""
   }
   response = requests.post(url, headers=headers, data=json.dumps(payload)).json()['data']['tracks']
-  return {int(track['nft_id']): track for track in response if track['nft_id'] is not None}
+  return {(int(track['nft_id']), is_catalog_contract(track['contract_address'])):
+      track for track in response if track['nft_id'] is not None}
+
+def get_zora_auction_started(last_block_number):
+  url = 'https://indexer-prod-mainnet.zora.co/v1/graphql'
+  headers = {
+    'content-type': 'application/json'
+  }
+  payload = {
+    'operationName': 'Catalog',
+    'query': """
+      query Catalog {
+        AuctionBidEvent(where: {
+          firstBid: {_eq: true},
+          blockNumber: {_gt: %s},
+          tokenContract: {_in: ["0x0bC2A24ce568DAd89691116d5B34DEB6C203F342", "0xabEFBc9fD2F806065b4f3C237d4b59D9A97Bcac7"]}
+        }) {
+          blockNumber
+          tokenContract
+          tokenId
+          value
+        }
+      }""" % last_block_number,
+    'variables': None
+  }
+  response = requests.post(url, headers=headers, data=json.dumps(payload)).json()\
+      ['data']['AuctionBidEvent']
+  if len(response) > 0:
+    r.set('last_block_number', max(int(r.get('last_block_number')),
+        max([bid['blockNumber'] for bid in response])))
+  return [(int(bid['tokenId']), is_catalog_contract(bid['tokenContract'])) for bid in response]
 
 def get_zora_sales(last_block_number):
   url = 'https://indexer-prod-mainnet.zora.co/v1/graphql'
@@ -72,31 +106,36 @@ def get_zora_sales(last_block_number):
   if len(response) > 0:
     r.set('last_block_number', max(int(r.get('last_block_number')),
         max([sale['blockNumber'] for sale in response])))
-  return {int(sale['tokenId']): sale for sale in response}
+  sales = {}
+  for sale in response:
+    sale['currency']['symbol'] = sale['currency']['symbol'].replace('WETH', 'ETH')
+    sale['winner'] = sale['recipient']
+    sales[(int(sale['tokenId']), False)] = sale
 
-def get_zora_auction_started(last_block_number):
-  url = 'https://indexer-prod-mainnet.zora.co/v1/graphql'
-  headers = {
-    'content-type': 'application/json'
-  }
   payload = {
     'operationName': 'Catalog',
     'query': """
       query Catalog {
-        AuctionBidEvent(where: {firstBid: {_eq: true}, blockNumber: {_gt: %s}}) {
+        AuctionEndedEvent(where: {
+          blockNumber: {_gt: %s},
+          tokenContract: {_eq: "0x0bC2A24ce568DAd89691116d5B34DEB6C203F342"}
+        }) {
+          amount
+          auctionCurrency
           blockNumber
+          tokenContract
           tokenId
-          value
+          winner
         }
       }""" % last_block_number,
     'variables': None
   }
   response = requests.post(url, headers=headers, data=json.dumps(payload)).json()\
-      ['data']['AuctionBidEvent']
+      ['data']['AuctionEndedEvent']
   if len(response) > 0:
     r.set('last_block_number', max(int(r.get('last_block_number')),
-        max([bid['blockNumber'] for bid in response])))
-  return [int(bid['tokenId']) for bid in response]
+        max([sale['blockNumber'] for sale in response])))
+  return sales | {(int(sale['tokenId']), True): sale for sale in response}
 
 def get_username(address):
   url = 'https://catalog-prod.hasura.app/v1/graphql'
@@ -133,34 +172,55 @@ def get_username(address):
       return '@' + handle.replace('/', '')
   return response[0]['name']
 
-def get_highest_bid(id):
+def get_highest_bid(id, contract_address):
   url = 'https://indexer-prod-mainnet.hasura.app/v1/graphql'
   headers = {
     'content-type': 'application/json'
   }
   payload = {
-    'operationName': 'GetMediaById',
+    'operationName': 'GetTokenById',
     'query': """
-      query GetMediaById($tokenId: String!) {
-        Media(where: {tokenId: {_eq: $tokenId}}) {
+      query GetTokenById($tokenId: String!, $tokenContractAddress: String!) {
+        Token(where: {tokenId: {_eq: $tokenId}, address: {_eq: $tokenContractAddress}}) {
           auctions(order_by: {createdEvent: {blockNumber: desc}}) {
             lastBidAmount
             lastBidder
           }
         }
       }""",
-    'variables': {'tokenId': id}
+    'variables': {'tokenId': id, 'tokenContractAddress': contract_address}
   }
   response = requests.post(url, headers=headers, data=json.dumps(payload)).json()\
-      ['data']['Media'][0]['auctions'][0]
+      ['data']['Token'][0]['auctions'][0]
   return int(response['lastBidAmount']) / 10**18, get_username(response['lastBidder'])
+
+def get_currency(contract_address):
+  url = 'https://indexer-prod-mainnet.zora.co/v1/graphql'
+  headers = {
+    'content-type': 'application/json'
+  }
+  payload = {
+    'operationName': 'Catalog',
+    'query': """
+      query Catalog {
+        Currency(where: {address: {_eq: "%s"}}) {
+          address
+          decimals
+          symbol
+        }
+      }""" % contract_address,
+    'variables': None
+  }
+  response = requests.post(url, headers=headers, data=json.dumps(payload)).json()\
+      ['data']['Currency']
+  return (response[0]['symbol'].replace('WETH', 'ETH'), response[0]['decimals'])
 
 ####################################################################################################
 
 def tweet_auction_started(record):
   name = record['title']
   artist = get_username(record['artist']['id'])
-  bid, username = get_highest_bid(record['nft_id'])
+  bid, username = get_highest_bid(record['nft_id'], record['contract_address'])
   handle = record['artist']['handle']
   url = record['short_url']
 
@@ -178,18 +238,20 @@ https://beta.catalog.works/%s/%s""" % (name, artist, bid, username, handle, url)
 def tweet_sale(record, sale):
   name = record['title']
   artist = get_username(record['artist']['id'])
-  collector = get_username(sale['recipient'])
-  price = int(sale['amount']) / 10**18
-  usd = locale.currency(price * eth_price, grouping=True)
+  collector = get_username(sale['winner'])
+  currency, decimals = sale['currency']['symbol'], sale['currency']['decimals'] \
+      if 'currency' in sale else get_currency(sale['auctionCurrency'])
+  price = int(sale['amount']) / 10**decimals
+  usd = '(%s)' % locale.currency(price * eth_price, grouping=True) if currency == 'ETH' else ''
   handle = record['artist']['handle']
   url = record['short_url']
 
   tweet = """💽 %s 💽
 
 ✨ Record by %s
-💰 Sold to %s for %s ETH (%s)
+💰 Sold to %s for %s %s %s
 
-https://beta.catalog.works/%s/%s""" % (name, artist, collector, price, usd, handle, url)
+https://beta.catalog.works/%s/%s""" % (name, artist, collector, price, currency, usd, handle, url)
 
   print(tweet)
   twitter.update_status(tweet)
@@ -209,11 +271,11 @@ catalog_records = get_catalog_records()
 last_block_number = int(r.get('last_block_number'))
 
 auction_started = get_zora_auction_started(last_block_number)
-for id in auction_started:
-  if id in catalog_records:
-    tweet_auction_started(catalog_records[id])
+for id, version in auction_started:
+  if (id, version) in catalog_records:
+    tweet_auction_started(catalog_records[(id, version)])
 
 zora_sales = get_zora_sales(last_block_number)
-for id in zora_sales:
-  if id in catalog_records:
-    tweet_sale(catalog_records[id], zora_sales[id])
+for id, version in zora_sales:
+  if (id, version) in catalog_records:
+    tweet_sale(catalog_records[(id, version)], zora_sales[(id, version)])
