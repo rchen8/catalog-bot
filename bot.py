@@ -1,5 +1,6 @@
 from dotenv import load_dotenv
 from pycoingecko import CoinGeckoAPI
+from web3 import Web3
 import json
 import locale
 import os
@@ -79,7 +80,7 @@ def get_zora_auction_started(last_block_number):
         max([bid['blockNumber'] for bid in response])))
   return [(int(bid['tokenId']), is_catalog_contract(bid['tokenContract'])) for bid in response]
 
-def get_zora_sales(last_block_number):
+def get_market_events(last_block_number):
   url = 'https://indexer-prod-mainnet.zora.co/v1/graphql'
   headers = {
     'content-type': 'application/json'
@@ -111,7 +112,36 @@ def get_zora_sales(last_block_number):
     sale['currency']['symbol'] = sale['currency']['symbol'].replace('WETH', 'ETH')
     sale['winner'] = sale['recipient']
     sales[(int(sale['tokenId']), False)] = sale
+  return sales
 
+def get_asks_events(last_block_number):
+  address = '0x6170b3c3a54c3d8c854934cbc314ed479b2b29a3'
+  topic0 = '0x21a9d8e221211780696258a05c6225b1a24f428e2fd4d51708f1ab2be4224d39'
+  url = 'https://api.etherscan.io/api?' + \
+      'module=logs&action=getLogs&fromBlock=%s&toBlock=latest&address=%s&topic0=%s&apikey=%s' % \
+      (last_block_number, address, topic0, os.environ['ETHERSCAN_API_KEY'])
+  sales = {}
+  for event in requests.get(url).json()['result']:
+    sale = {
+      'amount': int(event['data'][322:], 16),
+      'blockNumber': int(event['blockNumber'], 16),
+      'auctionCurrency': Web3.toChecksumAddress('0x' + event['data'][218:258]),
+      'winner': Web3.toChecksumAddress('0x' + event['topics'][3][-40:]),
+      'tokenContract': Web3.toChecksumAddress('0x' + event['topics'][1][-40:])
+    }
+    if sale['tokenContract'] != '0xabEFBc9fD2F806065b4f3C237d4b59D9A97Bcac7':
+      continue
+    if sale['auctionCurrency'] == '0x0000000000000000000000000000000000000000':
+      sale['auctionCurrency'] = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'
+    sales[(int(event['topics'][2], 16), False)] = sale
+    r.set('last_block_number', max(int(r.get('last_block_number')), sale['blockNumber']))
+  return sales
+
+def get_auction_events(last_block_number):
+  url = 'https://indexer-prod-mainnet.zora.co/v1/graphql'
+  headers = {
+    'content-type': 'application/json'
+  }
   payload = {
     'operationName': 'Catalog',
     'query': """
@@ -135,7 +165,12 @@ def get_zora_sales(last_block_number):
   if len(response) > 0:
     r.set('last_block_number', max(int(r.get('last_block_number')),
         max([sale['blockNumber'] for sale in response])))
-  return sales | {(int(sale['tokenId']), True): sale for sale in response}
+  return {(int(sale['tokenId']), True): sale for sale in response}
+
+def get_zora_sales(last_block_number):
+  return get_market_events(last_block_number) | \
+         get_asks_events(last_block_number) | \
+         get_auction_events(last_block_number)
 
 def get_username(address):
   url = 'https://catalog-prod.hasura.app/v1/graphql'
@@ -239,7 +274,7 @@ def tweet_sale(record, sale):
   name = record['title']
   artist = get_username(record['artist']['id'])
   collector = get_username(sale['winner'])
-  currency, decimals = sale['currency']['symbol'], sale['currency']['decimals'] \
+  currency, decimals = (sale['currency']['symbol'], sale['currency']['decimals']) \
       if 'currency' in sale else get_currency(sale['auctionCurrency'])
   price = int(sale['amount']) / 10**decimals
   usd = '(%s)' % locale.currency(price * eth_price, grouping=True) if currency == 'ETH' else ''
