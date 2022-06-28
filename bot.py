@@ -42,10 +42,16 @@ def get_catalog_record(id, contract_address):
         }
       }
       fragment IndexerTokenFragment on Token {
-        minter
-        owner
         auctions(order_by: {createdEvent: {blockNumber: desc}}) {
           ...IndexerAuctionFragment
+        }
+        media {
+          ...IndexerMediaFragment
+        }
+        minter
+        owner
+        v3Events(order_by: {blockNumber: desc_nulls_last}) {
+          ...V3Event
         }
       }
       fragment IndexerAuctionFragment on Auction {
@@ -55,6 +61,19 @@ def get_catalog_record(id, contract_address):
         }
         lastBidAmount
         lastBidder
+      }
+      fragment IndexerMediaFragment on Media {
+        askEvents(order_by: {blockNumber: desc}) {
+          ...AskEventFragment
+        }
+      }
+      fragment AskEventFragment on MarketAskEvent {
+        amount
+        currency
+      }
+      fragment V3Event on Event {
+        details
+        eventType
       }""",
     'variables': {'tokenId': str(id), 'tokenContractAddress': contract_address}
   }
@@ -177,7 +196,7 @@ def get_zora_market_events(last_block_number):
   for event in requests.get(url).json()['result']:
     token_id = int(event['topics'][1], 16)
     if token_id in catalog_ids:
-      sales.append((token_id, zora_contract))
+      sales.append((token_id, zora_contract, 'market'))
     r.set('last_block_number', max(int(r.get('last_block_number')), int(event['blockNumber'], 16)))
   return sales
 
@@ -193,9 +212,9 @@ def get_zora_asks_events(last_block_number):
     token_id = int(event['topics'][2], 16)
     contract_address = '0x' + event['topics'][1][-40:]
     if contract_address == zora_contract.lower() and token_id in catalog_ids:
-      sales.append((token_id, zora_contract))
+      sales.append((token_id, zora_contract, 'asks'))
     elif contract_address == catalog_contract.lower():
-      sales.append((token_id, catalog_contract))
+      sales.append((token_id, catalog_contract, 'asks'))
     r.set('last_block_number', max(int(r.get('last_block_number')), int(event['blockNumber'], 16)))
   return sales
 
@@ -209,7 +228,7 @@ def get_zora_auction_events(last_block_number):
   sales = []
   for event in requests.get(url).json()['result']:
     if '0x' + event['topics'][3][-40:] == catalog_contract.lower():
-      sales.append((int(event['topics'][2], 16), catalog_contract))
+      sales.append((int(event['topics'][2], 16), catalog_contract, 'auction'))
     r.set('last_block_number', max(int(r.get('last_block_number')), int(event['blockNumber'], 16)))
   return sales
 
@@ -217,6 +236,27 @@ def get_zora_sales(last_block_number):
   return get_zora_market_events(last_block_number) + \
          get_zora_asks_events(last_block_number) + \
          get_zora_auction_events(last_block_number)
+
+def get_currency(contract_address):
+  url = 'https://indexer-prod-mainnet.zora.co/v1/graphql'
+  headers = {
+    'content-type': 'application/json'
+  }
+  payload = {
+    'operationName': 'Catalog',
+    'query': """
+      query Catalog {
+        Currency(where: {address: {_eq: "%s"}}) {
+          address
+          decimals
+          symbol
+        }
+      }""" % contract_address,
+    'variables': None
+  }
+  response = requests.post(url, headers=headers, data=json.dumps(payload)).json()\
+      ['data']['Currency']
+  return (response[0]['symbol'].replace('WETH', 'ETH'), response[0]['decimals'])
 
 ### TWITTER ########################################################################################
 
@@ -240,13 +280,24 @@ Current bid: %s ETH by %s
   print(tweet)
   twitter.update_status(tweet)
 
-def tweet_sale(record, id, contract_address):
+def tweet_sale(record, id, contract_address, event):
   name = records[(id, contract_address)]['title']
   artist = get_username(record['minter'])
   collector = get_username(record['owner'])
-  price = int(record['auctions'][0]['lastBidAmount']) / \
-      10**record['auctions'][0]['currency']['decimals']
-  currency = record['auctions'][0]['currency']['symbol'].replace('WETH', 'ETH')
+
+  if event == 'market':
+    currency = get_currency(record['media']['askEvents'][0]['currency'])
+    price = int(record['media']['askEvents'][0]['amount']) / 10**currency[1]
+    currency = currency[0]
+  elif event == 'asks':
+    currency = get_currency(record['v3Events'][0]['details']['askCurrency'])
+    price = int(record['v3Events'][0]['details']['askPrice']) / 10**currency[1]
+    currency = currency[0]
+  elif event == 'auction':
+    price = int(record['auctions'][0]['lastBidAmount']) / \
+        10**record['auctions'][0]['currency']['decimals']
+    currency = record['auctions'][0]['currency']['symbol'].replace('WETH', 'ETH')
+
   usd = '(%s)' % locale.currency(price * eth_price, grouping=True) if currency == 'ETH' else ''
   url = 'https://beta.catalog.works/%s/%s' % \
       (record['minter'], records[(id, contract_address)]['short_url'])
@@ -280,7 +331,7 @@ try:
   for id, contract_address in get_zora_bid_events(last_block_number):
     tweet_auction_started(get_catalog_record(id, contract_address), id, contract_address)
 
-  for id, contract_address in get_zora_sales(last_block_number):
-    tweet_sale(get_catalog_record(id, contract_address), id, contract_address)
+  for id, contract_address, event in get_zora_sales(last_block_number):
+    tweet_sale(get_catalog_record(id, contract_address), id, contract_address, event)
 except Exception as e:
   send_discord_notification(traceback.format_exc())
