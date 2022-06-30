@@ -185,6 +185,24 @@ def get_zora_bid_events(last_block_number):
       auctions.append((int(bid['tokenId']), bid['tokenContract']))
   return auctions
 
+def get_zora_auction_events(last_block_number):
+  address = '0xe468ce99444174bd3bbbed09209577d25d1ad673'
+  topic0 = '0x4f35fb3ea0081b3ccbe8df613cab0f9e1694d50a025e0aa09b88a86a3d07c2de'
+  url = 'https://api.etherscan.io/api?' + \
+      'module=logs&action=getLogs&fromBlock=%s&toBlock=latest&address=%s&topic0=%s&apikey=%s' % \
+      (last_block_number, address, topic0, os.environ['ETHERSCAN_API_KEY'])
+
+  sales = []
+  for event in requests.get(url).json()['result']:
+    token_id = int(event['topics'][2], 16)
+    contract_address = '0x' + event['topics'][3][-40:]
+    if contract_address == zora_contract.lower() and token_id in catalog_ids:
+      sales.append((token_id, zora_contract, 'auction'))
+    elif contract_address == catalog_contract.lower():
+      sales.append((token_id, catalog_contract, 'auction'))
+    r.set('last_block_number', max(int(r.get('last_block_number')), int(event['blockNumber'], 16)))
+  return sales
+
 def get_zora_market_events(last_block_number):
   address = '0xe5bfab544eca83849c53464f85b7164375bdaac1'
   topic0 = '0xb6ef177c7a6f32b283a49b5e0463a39240cdaa278028dfb219480d050e8ee54c'
@@ -200,7 +218,7 @@ def get_zora_market_events(last_block_number):
     r.set('last_block_number', max(int(r.get('last_block_number')), int(event['blockNumber'], 16)))
   return sales
 
-def get_zora_asks_events(last_block_number):
+def get_zora_v3_asks_events(last_block_number):
   address = '0x6170b3c3a54c3d8c854934cbc314ed479b2b29a3'
   topic0 = '0x21a9d8e221211780696258a05c6225b1a24f428e2fd4d51708f1ab2be4224d39'
   url = 'https://api.etherscan.io/api?' + \
@@ -218,24 +236,12 @@ def get_zora_asks_events(last_block_number):
     r.set('last_block_number', max(int(r.get('last_block_number')), int(event['blockNumber'], 16)))
   return sales
 
-def get_zora_auction_events(last_block_number):
-  address = '0xe468ce99444174bd3bbbed09209577d25d1ad673'
-  topic0 = '0x4f35fb3ea0081b3ccbe8df613cab0f9e1694d50a025e0aa09b88a86a3d07c2de'
-  url = 'https://api.etherscan.io/api?' + \
-      'module=logs&action=getLogs&fromBlock=%s&toBlock=latest&address=%s&topic0=%s&apikey=%s' % \
-      (last_block_number, address, topic0, os.environ['ETHERSCAN_API_KEY'])
-
-  sales = []
-  for event in requests.get(url).json()['result']:
-    if '0x' + event['topics'][3][-40:] == catalog_contract.lower():
-      sales.append((int(event['topics'][2], 16), catalog_contract, 'auction'))
-    r.set('last_block_number', max(int(r.get('last_block_number')), int(event['blockNumber'], 16)))
-  return sales
-
 def get_zora_sales(last_block_number):
-  return get_zora_market_events(last_block_number) + \
-         get_zora_asks_events(last_block_number) + \
-         get_zora_auction_events(last_block_number)
+  sales = get_zora_auction_events(last_block_number)
+  for sale in get_zora_market_events(last_block_number):
+    if sale[0] not in [x[0] for x in sales]:
+      sales.append(sale)
+  return sales + get_zora_v3_asks_events(last_block_number)
 
 def get_currency(contract_address):
   url = 'https://indexer-prod-mainnet.zora.co/v1/graphql'
